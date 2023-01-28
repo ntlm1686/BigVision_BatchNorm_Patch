@@ -139,18 +139,21 @@ def main(argv):
     bs = batch_size // jax.device_count()
     image_size = tuple(train_ds.element_spec["image"].shape[1:])
     no_image = jnp.zeros((bs,) + image_size, jnp.float32)
-    params = flax.core.unfreeze(model.init(rng, no_image))["params"]
+    # params = flax.core.unfreeze(model.init(rng, no_image, train=False))["params"]
+    variables = flax.core.unfreeze(model.init(rng, no_image, train=False))
+    params = variables["params"]
+    batch_stats = variables['batch_stats']
 
     # Set bias in the head to a low value, such that loss is small initially.
     if "init_head_bias" in config:
       params["head"]["bias"] = jnp.full_like(params["head"]["bias"],
                                              config["init_head_bias"])
 
-    return params
+    return params, batch_stats
 
   rng, rng_init = jax.random.split(rng)
   with u.chrono.log_timing("z/secs/init"):
-    params_cpu = init(rng_init)
+    params_cpu, batch_stats_cpu = init(rng_init)
 
   if jax.process_index() == 0:
     num_params = sum(p.size for p in jax.tree_leaves(params_cpu))
@@ -166,7 +169,7 @@ def main(argv):
   sched_fns_cpu = [jax.jit(sched_fn, backend="cpu") for sched_fn in sched_fns]
 
   @functools.partial(jax.pmap, axis_name="batch", donate_argnums=(0, 1))
-  def update_fn(params, opt, rng, images, labels):
+  def update_fn(params, batch_stats, opt, rng, images, labels):
     """Update step."""
 
     measurements = {}
@@ -178,17 +181,26 @@ def main(argv):
     rng, rng_model = jax.random.split(rng, 2)
     rng_model_local = jax.random.fold_in(rng_model, jax.lax.axis_index("batch"))
 
-    def loss_fn(params, images, labels):
-      logits, _ = model.apply(
-          {"params": params}, images,
-          train=True, rngs={"dropout": rng_model_local})
-      return getattr(u, config.get("loss", "sigmoid_xent"))(
-          logits=logits, labels=labels)
+    # def loss_fn(params, images, labels):
+    #   logits, _ = model.apply(
+    #       {"params": params}, images,
+    #       train=True, rngs={"dropout": rng_model_local})
+    #   return getattr(u, config.get("loss", "sigmoid_xent"))(
+    #       logits=logits, labels=labels)
 
-    l, grads = jax.value_and_grad(loss_fn)(params, images, labels)
+    def loss_fn(params, images, labels):
+      (logits, _), updates_bn = model.apply(
+          {"params": params, "batch_stats": batch_stats}, images,
+          train=True, rngs={"dropout": rng_model_local}, mutable=['batch_stats'])
+      return getattr(u, config.get("loss", "sigmoid_xent"))(
+          logits=logits, labels=labels), updates_bn
+
+    (l, updates_bn), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, images, labels)
     l, grads = jax.lax.pmean((l, grads), axis_name="batch")
     updates, opt = tx.update(grads, opt, params)
     params = optax.apply_updates(params, updates)
+    batch_stats = updates_bn["batch_stats"]
+
 
     gs = jax.tree_leaves(bv_optax.replace_frozen(config.schedule, grads, 0.))
     measurements["l2_grads"] = jnp.sqrt(sum([jnp.vdot(g, g) for g in gs]))
@@ -197,13 +209,13 @@ def main(argv):
     us = jax.tree_leaves(updates)
     measurements["l2_updates"] = jnp.sqrt(sum([jnp.vdot(u, u) for u in us]))
 
-    return params, opt, rng, l, measurements
+    return params, batch_stats, opt, rng, l, measurements
 
   # We do not jit/pmap this function, because it is passed to evaluator that
   # does it later. We output as many intermediate tensors as possible for
   # maximal flexibility. Later `jit` will prune out things that are not needed.
   def predict_fn(params, image):
-    logits, out = model.apply({"params": params}, image)
+    logits, out = model.apply({"params": params[0], "batch_stats": params[1]}, image)
     return logits, out
 
   # Only initialize evaluators when they are first needed.
@@ -255,6 +267,7 @@ def main(argv):
   write_note(f"Replicating...\n{u.chrono.note}")
   params_repl = flax.jax_utils.replicate(params_cpu)
   opt_repl = flax.jax_utils.replicate(opt_cpu)
+  batch_stats_repl = flax.jax_utils.replicate(batch_stats_cpu)
 
   rng, rng_loop = jax.random.split(rng, 2)
   rngs_loop = flax.jax_utils.replicate(rng_loop)
@@ -269,8 +282,8 @@ def main(argv):
 
     with jax.profiler.StepTraceAnnotation("train_step", step_num=step):
       with u.chrono.log_timing("z/secs/update0", noop=step > first_step + 1):
-        params_repl, opt_repl, rngs_loop, loss_value, measurements = update_fn(
-            params_repl, opt_repl, rngs_loop, batch["image"], batch["labels"])
+        params_repl, batch_stats_repl, opt_repl, rngs_loop, loss_value, measurements = update_fn(
+            params_repl, batch_stats_repl, opt_repl, rngs_loop, batch["image"], batch["labels"])
 
     # On the first host, let's always profile a handful of early steps.
     if jax.process_index() == 0:
@@ -299,6 +312,7 @@ def main(argv):
       # alive while they'll be updated in a future step, creating hard to debug
       # memory errors (see (internal link)). Also, takes device 0's params only.
       params_cpu = jax.tree_map(lambda x: np.array(x[0]), params_repl)
+      batch_stats_cpu = jax.tree_map(lambda x: np.array(x[0]), batch_stats_repl)
       opt_cpu = jax.tree_map(lambda x: np.array(x[0]), opt_repl)
 
       # Check whether we want to keep a copy of the current checkpoint.
@@ -306,7 +320,7 @@ def main(argv):
       if u.itstime(step, get_steps("keep_ckpt", None), total_steps):
         copy_step = step
 
-      ckpt = {"params": params_cpu, "opt": opt_cpu, "chrono": u.chrono.save()}
+      ckpt = {"params": params_cpu, "batch_stats": batch_stats_cpu, "opt": opt_cpu, "chrono": u.chrono.save()}
       ckpt_writer = pool.apply_async(
           u.save_checkpoint, (ckpt, save_ckpt_path, copy_step))
       u.chrono.resume()
@@ -318,7 +332,7 @@ def main(argv):
         u.chrono.tick(step)  # Record things like epoch number, core hours etc.
         write_note(f"{name} evaluation...\n{u.chrono.note}")
         with u.chrono.log_timing(f"z/secs/eval/{name}"):
-          for key, value in evaluator.run(params_repl):
+          for key, value in evaluator.run((params_repl, batch_stats_repl)):
             mw.measure(f"{prefix}{key}", value)
         u.chrono.resume()
     mw.step_end()
@@ -330,7 +344,7 @@ def main(argv):
   for (name, evaluator, _, prefix) in evaluators():
     write_note(f"{name} evaluation...\n{u.chrono.note}")
     with u.chrono.log_timing(f"z/secs/eval/{name}"):
-      for key, value in evaluator.run(params_repl):
+      for key, value in evaluator.run((params_repl, batch_stats_repl)):
         mw.measure(f"{prefix}{key}", value)
 
   # Always give a chance to stop the profiler, no matter how things ended.
@@ -353,3 +367,4 @@ def main(argv):
 
 if __name__ == "__main__":
   app.run(main)
+
